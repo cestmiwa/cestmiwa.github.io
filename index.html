@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reader</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // --- 設定・初期化 ---
+        const { useState, useRef, useEffect, useCallback } = React;
+
+        // 【ここに入れて】 
+        // reader.jsx のファイル内容（import ... から、最後の </style> } まで）を
+        // この行の下にそのままペーストしてください。
+        // ※ただし、一番上の「import { useState, useRef, useEffect, useCallback } from "react";」という1行だけは不要なので削除してください。
+
+
+const C = {
+  bg: "#f5f0e8",
+  paper: "#fdfaf4",
+  ink: "#1a1410",
+  inkLight: "#6b5f52",
+  accent: "#8b4513",
+  accentPale: "#d4a87a",
+  highlight: "#f0d080",
+  highlightJa: "#d4edda",
+  border: "#d4c8b0",
+};
+
+const SLEEP_OPTIONS = [
+  { label: "なし", value: 0 },
+  { label: "10分", value: 10 },
+  { label: "20分", value: 20 },
+  { label: "30分", value: 30 },
+  { label: "45分", value: 45 },
+  { label: "60分", value: 60 },
+];
+
+const Btn = ({ onClick, disabled, children, variant = "ghost", style = {} }) => {
+  const base = {
+    fontFamily: "sans-serif", fontSize: "0.78rem", letterSpacing: "0.08em",
+    padding: "7px 14px", borderRadius: 2, border: "none",
+    cursor: disabled ? "not-allowed" : "pointer", transition: "all 0.15s", ...style
+  };
+  const styles = {
+    primary: { ...base, background: disabled ? C.border : C.accent, color: disabled ? C.inkLight : "#fdfaf4" },
+    ghost: { ...base, background: "transparent", color: C.inkLight, border: `1px solid ${C.border}` },
+    green: { ...base, background: disabled ? C.border : "#2d6a4f", color: disabled ? C.inkLight : "#fff" },
+    blue:  { ...base, background: disabled ? C.border : "#1a3a5c", color: disabled ? C.inkLight : "#fff" },
+  };
+  return <button onClick={onClick} disabled={disabled} style={styles[variant]}>{children}</button>;
+};
+
+// Detect if a paragraph is likely English
+const isEnglish = (text) => {
+  const ascii = text.replace(/[^a-zA-Z\u3000-\u9fff]/g, "");
+  const enChars = (text.match(/[a-zA-Z]/g) || []).length;
+  const jaChars = (text.match(/[\u3040-\u9fff]/g) || []).length;
+  if (enChars + jaChars === 0) return false;
+  return enChars > jaChars;
+};
+
+// Parse text into EN/JA pairs
+// Expects alternating EN, JA paragraphs
+const parsePairs = (paragraphs) => {
+  const pairs = [];
+  let i = 0;
+  while (i < paragraphs.length) {
+    const p = paragraphs[i];
+    const en = isEnglish(p);
+    if (en && i + 1 < paragraphs.length && !isEnglish(paragraphs[i + 1])) {
+      pairs.push({ en: p, ja: paragraphs[i + 1], idx: i });
+      i += 2;
+    } else {
+      // fallback: single paragraph
+      pairs.push({ en: en ? p : null, ja: !en ? p : null, single: p, idx: i });
+      i += 1;
+    }
+  }
+  return pairs;
+};
+
+export default function Reader() {
+  const [paragraphs, setParagraphs] = useState([]);
+  const [pairs, setPairs] = useState([]);
+  const [mode, setMode] = useState("normal"); // "normal" | "listening"
+  const [currentIdx, setCurrentIdx] = useState(0); // paragraph index (normal mode)
+  const [currentPairIdx, setCurrentPairIdx] = useState(0); // pair index (listening mode)
+  const [listenStep, setListenStep] = useState("playing"); // "playing"|"showEn"|"showJa"
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const [voices, setVoices] = useState([]);
+  const [voiceJa, setVoiceJa] = useState("");
+  const [voiceEn, setVoiceEn] = useState("");
+  const [rate, setRate] = useState(1.0);
+  const [pitch, setPitch] = useState(1.0);
+  const [status, setStatus] = useState("");
+  const [fileName, setFileName] = useState("");
+  const [dragging, setDragging] = useState(false);
+  const [jumpInput, setJumpInput] = useState("");
+  const [sleepMinutes, setSleepMinutes] = useState(0);
+  const [sleepRemaining, setSleepRemaining] = useState(null);
+
+  const synthRef = useRef(window.speechSynthesis);
+  const isPlayingRef = useRef(false);
+  const currentIdxRef = useRef(0);
+  const paraRefs = useRef([]);
+  const pairRefs = useRef([]);
+  const sleepTimerRef = useRef(null);
+  const sleepEndRef = useRef(null);
+
+  useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
+  useEffect(() => { currentIdxRef.current = currentIdx; }, [currentIdx]);
+
+  // voices
+  useEffect(() => {
+    const load = () => {
+      const v = synthRef.current.getVoices();
+      setVoices(v);
+      const ja = v.find(x => x.lang.startsWith("ja"));
+      const en = v.find(x => x.lang.startsWith("en"));
+      if (ja) setVoiceJa(String(v.indexOf(ja)));
+      if (en) setVoiceEn(String(v.indexOf(en)));
+    };
+    load();
+    synthRef.current.onvoiceschanged = load;
+    return () => { synthRef.current.cancel(); clearSleepTimer(); };
+  }, []);
+
+  // scroll
+  useEffect(() => {
+    if (mode === "normal" && paraRefs.current[currentIdx]) {
+      paraRefs.current[currentIdx].scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [currentIdx, mode]);
+
+  useEffect(() => {
+    if (mode === "listening" && pairRefs.current[currentPairIdx]) {
+      pairRefs.current[currentPairIdx].scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [currentPairIdx, mode]);
+
+  // ── sleep timer ──────────────────────────────────────────────
+  const clearSleepTimer = () => {
+    if (sleepTimerRef.current) clearInterval(sleepTimerRef.current);
+    sleepTimerRef.current = null; sleepEndRef.current = null;
+    setSleepRemaining(null);
+  };
+  const startSleepTimer = useCallback((minutes) => {
+    clearSleepTimer();
+    if (!minutes) return;
+    const end = Date.now() + minutes * 60000;
+    sleepEndRef.current = end;
+    setSleepRemaining(minutes * 60);
+    sleepTimerRef.current = setInterval(() => {
+      const rem = Math.round((sleepEndRef.current - Date.now()) / 1000);
+      if (rem <= 0) {
+        clearSleepTimer();
+        synthRef.current.cancel();
+        setIsPlaying(false); isPlayingRef.current = false;
+        setIsPaused(false);
+        setStatus("🌙 スリープタイマーで停止しました");
+      } else setSleepRemaining(rem);
+    }, 1000);
+  }, []);
+  const fmt = (s) => s === null ? null : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+
+  // ── text loading ────────────────────────────────────────────
+  const processText = useCallback((text, name = "") => {
+    const paras = text.split(/\n+/).map(p => p.trim()).filter(p => p.length > 0);
+    if (!paras.length) return;
+    synthRef.current.cancel();
+    setIsPlaying(false); isPlayingRef.current = false;
+    setIsPaused(false);
+    setCurrentIdx(0); currentIdxRef.current = 0;
+    setCurrentPairIdx(0);
+    setListenStep("playing");
+    setParagraphs(paras);
+    const p = parsePairs(paras);
+    setPairs(p);
+    paraRefs.current = new Array(paras.length);
+    pairRefs.current = new Array(p.length);
+    if (name) setFileName(name);
+    setStatus(`${paras.length} 段落（${p.length} ペア）を読み込みました`);
+  }, []);
+
+  const handleFile = useCallback((file) => {
+    if (!file) { setStatus("⚠ ファイルを選択してください"); return; }
+    const r = new FileReader();
+    r.onload = e => processText(e.target.result, file.name);
+    r.onerror = () => setStatus("⚠ ファイルを読み込めませんでした");
+    r.readAsText(file, "UTF-8");
+  }, [processText]);
+
+  const handleDrop = useCallback((e) => { e.preventDefault(); setDragging(false); handleFile(e.dataTransfer.files[0]); }, [handleFile]);
+  const handleFileInput = useCallback((e) => { handleFile(e.target.files[0]); e.target.value = ""; }, [handleFile]);
+
+  // ── voice helper ─────────────────────────────────────────────
+  const getVoice = useCallback((text) => {
+    const en = isEnglish(text);
+    const idx = parseInt(en ? voiceEn : voiceJa);
+    return voices[idx] || null;
+  }, [voices, voiceEn, voiceJa]);
+
+  // ── normal mode playback ─────────────────────────────────────
+  const speakFrom = useCallback((idx) => {
+    if (!isPlayingRef.current) return;
+    if (idx >= paragraphs.length) {
+      setIsPlaying(false); isPlayingRef.current = false;
+      setIsPaused(false); setStatus("✓ 読み上げ完了");
+      setCurrentIdx(0); clearSleepTimer(); return;
+    }
+    setCurrentIdx(idx); currentIdxRef.current = idx;
+    const utt = new SpeechSynthesisUtterance(paragraphs[idx]);
+    utt.rate = rate; utt.pitch = pitch;
+    const v = getVoice(paragraphs[idx]);
+    if (v) { utt.voice = v; utt.lang = v.lang; }
+    else utt.lang = isEnglish(paragraphs[idx]) ? "en-US" : "ja-JP";
+    utt.onend = () => { if (isPlayingRef.current) speakFrom(idx + 1); };
+    utt.onerror = (e) => {
+      if (e.error === "interrupted" || e.error === "canceled") return;
+      setStatus("エラー: " + e.error); setIsPlaying(false); isPlayingRef.current = false;
+    };
+    synthRef.current.cancel();
+    setTimeout(() => synthRef.current.speak(utt), 80);
+  }, [paragraphs, rate, pitch, getVoice]);
+
+  const togglePlay = useCallback(() => {
+    if (!paragraphs.length) return;
+    if (isPlaying) {
+      synthRef.current.cancel();
+      setIsPlaying(false); isPlayingRef.current = false;
+      setIsPaused(true);
+      setStatus(`⏸ 第 ${currentIdxRef.current + 1} 段落で一時停止`);
+    } else {
+      setIsPlaying(true); isPlayingRef.current = true;
+      setIsPaused(false);
+      if (sleepMinutes > 0 && sleepRemaining === null) startSleepTimer(sleepMinutes);
+      speakFrom(currentIdxRef.current);
+    }
+  }, [isPlaying, paragraphs, speakFrom, sleepMinutes, sleepRemaining, startSleepTimer]);
+
+  const stop = useCallback(() => {
+    synthRef.current.cancel();
+    setIsPlaying(false); isPlayingRef.current = false;
+    setIsPaused(false); setCurrentIdx(0); currentIdxRef.current = 0;
+    setStatus(""); clearSleepTimer();
+  }, []);
+
+  const jumpTo = useCallback((idx) => {
+    if (idx < 0 || idx >= paragraphs.length) return;
+    const was = isPlayingRef.current;
+    synthRef.current.cancel();
+    setCurrentIdx(idx); currentIdxRef.current = idx;
+    if (was) setTimeout(() => speakFrom(idx), 120);
+    else { setIsPaused(true); setStatus(`第 ${idx + 1} 段落に移動`); }
+  }, [paragraphs.length, speakFrom]);
+
+  const handleJump = useCallback(() => {
+    const n = parseInt(jumpInput);
+    if (isNaN(n) || n < 1 || n > paragraphs.length) { setStatus(`⚠ 1〜${paragraphs.length} の数字を入力してください`); return; }
+    setJumpInput(""); jumpTo(n - 1);
+  }, [jumpInput, paragraphs.length, jumpTo]);
+
+  // ── listening mode ───────────────────────────────────────────
+  const speakPair = useCallback((pairIdx) => {
+    if (!isPlayingRef.current) return;
+    if (pairIdx >= pairs.length) {
+      setIsPlaying(false); isPlayingRef.current = false;
+      setStatus("✓ 完了"); clearSleepTimer(); return;
+    }
+    setCurrentPairIdx(pairIdx);
+    setListenStep("playing");
+    const pair = pairs[pairIdx];
+    const text = pair.en || pair.single;
+    if (!text) { speakPair(pairIdx + 1); return; }
+
+    const utt = new SpeechSynthesisUtterance(text);
+    utt.rate = rate; utt.pitch = pitch;
+    const v = getVoice(text);
+    if (v) { utt.voice = v; utt.lang = v.lang; }
+    else utt.lang = "en-US";
+    utt.onend = () => {
+      if (isPlayingRef.current) {
+        setIsPlaying(false); isPlayingRef.current = false;
+        setListenStep("showEn");
+        setStatus("英文を確認するか、次へ進んでください");
+      }
+    };
+    utt.onerror = (e) => {
+      if (e.error === "interrupted" || e.error === "canceled") return;
+      setStatus("エラー: " + e.error);
+    };
+    synthRef.current.cancel();
+    setTimeout(() => synthRef.current.speak(utt), 80);
+    setStatus('<span>🔊 再生中...</span>');
+  }, [pairs, rate, pitch, getVoice]);
+
+  const startListening = useCallback(() => {
+    if (!pairs.length) return;
+    setIsPlaying(true); isPlayingRef.current = true;
+    setIsPaused(false);
+    if (sleepMinutes > 0 && sleepRemaining === null) startSleepTimer(sleepMinutes);
+    speakPair(currentPairIdx);
+  }, [pairs, currentPairIdx, speakPair, sleepMinutes, sleepRemaining, startSleepTimer]);
+
+  const showEnglish = () => setListenStep("showEn");
+  const showJapanese = () => setListenStep("showJa");
+  const nextPair = useCallback(() => {
+    const next = currentPairIdx + 1;
+    if (next >= pairs.length) { setStatus("✓ 全ペア完了"); return; }
+    setCurrentPairIdx(next);
+    setListenStep("playing");
+    setIsPlaying(true); isPlayingRef.current = true;
+    speakPair(next);
+  }, [currentPairIdx, pairs.length, speakPair]);
+
+  const replayPair = useCallback(() => {
+    setIsPlaying(true); isPlayingRef.current = true;
+    setListenStep("playing");
+    speakPair(currentPairIdx);
+  }, [currentPairIdx, speakPair]);
+
+  // space key (normal mode only)
+  useEffect(() => {
+    const handler = (e) => {
+      if (mode !== "normal") return;
+      if (e.code === "Space" && e.target.tagName !== "INPUT") {
+        e.preventDefault();
+        if (paragraphs.length > 0) togglePlay();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [togglePlay, paragraphs, mode]);
+
+  const progress = paragraphs.length > 0 ? Math.round(((currentIdx + (isPlaying ? 1 : 0)) / paragraphs.length) * 100) : 0;
+  const pairProgress = pairs.length > 0 ? Math.round((currentPairIdx / pairs.length) * 100) : 0;
+
+  const jaVoices = voices.filter(v => v.lang.startsWith("ja"));
+  const enVoices = voices.filter(v => v.lang.startsWith("en"));
+
+  return (
+    <div style={{ background: C.bg, minHeight: "100vh", fontFamily: "sans-serif", color: C.ink }}>
+      {/* header */}
+      <div style={{ maxWidth: 820, margin: "0 auto", padding: "16px 24px 10px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", gap: 12 }}>
+        <span style={{ fontFamily: "serif", fontWeight: 300, fontSize: "1.2rem", letterSpacing: "0.15em" }}>読み上げ</span>
+        <span style={{ fontSize: "0.62rem", letterSpacing: "0.12em", color: C.inkLight, textTransform: "uppercase" }}>Text Reader</span>
+        {/* mode toggle */}
+        <div style={{ marginLeft: "auto", display: "flex", gap: 0, border: `1px solid ${C.border}`, borderRadius: 3, overflow: "hidden" }}>
+          {["normal", "listening"].map(m => (
+            <button key={m} onClick={() => { synthRef.current.cancel(); setIsPlaying(false); isPlayingRef.current = false; setMode(m); setStatus(""); }}
+              style={{ fontSize: "0.72rem", padding: "5px 14px", border: "none", cursor: "pointer", background: mode === m ? C.accent : C.paper, color: mode === m ? "#fff" : C.inkLight, letterSpacing: "0.06em", transition: "all 0.15s" }}>
+              {m === "normal" ? "📖 通常" : "🎧 リスニング"}
+            </button>
+          ))}
+        </div>
+        {sleepRemaining !== null && (
+          <span style={{ fontSize: "0.75rem", color: C.accent, letterSpacing: "0.06em" }}>🌙 {fmt(sleepRemaining)}</span>
+        )}
+      </div>
+
+      <div style={{ maxWidth: 820, margin: "0 auto", padding: "12px 24px 24px", display: "flex", flexDirection: "column", gap: 12 }}>
+
+        {/* drop zone */}
+        <label onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={handleDrop}
+          style={{ display: "flex", alignItems: "center", gap: 12, background: dragging ? "#fdf6ec" : C.paper, border: `1.5px dashed ${dragging ? C.accentPale : C.border}`, borderRadius: 2, padding: "10px 14px", cursor: "pointer", transition: "all 0.2s" }}>
+          <span style={{ fontSize: "1.2rem", opacity: 0.5 }}>📄</span>
+          <div>
+            <div style={{ fontSize: "0.8rem", color: fileName ? C.accent : C.inkLight }}>{fileName ? `✓ ${fileName}` : "ファイルをドロップ、またはクリックして選択"}</div>
+            <div style={{ fontSize: "0.63rem", color: "#b8a898", marginTop: 1 }}>英日交互テキスト対応 / .txt / .pages などのテキストファイル</div>
+          </div>
+          <input type="file" accept=".txt,.pages,text/plain,text/*" onChange={handleFileInput} style={{ display: "none" }} />
+        </label>
+
+        {/* paste area */}
+        {!paragraphs.length && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ fontSize: "0.6rem", letterSpacing: "0.12em", color: C.inkLight, textTransform: "uppercase" }}>または直接貼り付け</div>
+            <textarea
+              placeholder="ここにテキストを貼り付けて「読み込む」を押してください"
+              id="pasteArea"
+              style={{ width: "100%", minHeight: 100, fontFamily: "serif", fontSize: "0.9rem", lineHeight: 1.8, padding: "10px 12px", border: `1px solid ${C.border}`, borderRadius: 2, background: C.paper, color: C.ink, resize: "vertical", outline: "none" }}
+            />
+            <div style={{ display: "flex", justifyContent: "flex-end" }}>
+              <Btn variant="primary" onClick={() => {
+                const el = document.getElementById("pasteArea");
+                if (el && el.value.trim()) processText(el.value, "貼り付けテキスト");
+              }}>読み込む →</Btn>
+            </div>
+          </div>
+        )}
+        {paragraphs.length > 0 && (
+          <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            <Btn onClick={() => { setParagraphs([]); setPairs([]); setFileName(""); setStatus(""); synthRef.current.cancel(); setIsPlaying(false); isPlayingRef.current = false; }}>✕ クリア</Btn>
+          </div>
+        )}
+
+        {/* settings */}
+        <div style={{ background: C.paper, border: `1px solid ${C.border}`, borderRadius: 2, padding: "10px 14px", display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: "8px 14px", alignItems: "end" }}>
+          <div>
+            <div style={{ fontSize: "0.6rem", letterSpacing: "0.1em", color: C.inkLight, textTransform: "uppercase", marginBottom: 4 }}>速度 <span style={{ color: C.accent }}>{rate.toFixed(1)}</span></div>
+            <input type="range" min="0.5" max="2.0" step="0.1" value={rate} onChange={e => setRate(parseFloat(e.target.value))} style={{ width: "100%", accentColor: C.accent }} />
+          </div>
+          <div>
+            <div style={{ fontSize: "0.6rem", letterSpacing: "0.1em", color: C.inkLight, textTransform: "uppercase", marginBottom: 4 }}>音の高さ <span style={{ color: C.accent }}>{pitch.toFixed(1)}</span></div>
+            <input type="range" min="0.5" max="1.5" step="0.1" value={pitch} onChange={e => setPitch(parseFloat(e.target.value))} style={{ width: "100%", accentColor: C.accent }} />
+          </div>
+          <div>
+            <div style={{ fontSize: "0.6rem", letterSpacing: "0.1em", color: C.inkLight, textTransform: "uppercase", marginBottom: 4 }}>🌙 スリープ</div>
+            <select value={sleepMinutes} onChange={e => { const v = parseInt(e.target.value); setSleepMinutes(v); if (sleepRemaining !== null) { clearSleepTimer(); if (v > 0) startSleepTimer(v); } }}
+              style={{ width: "100%", fontSize: "0.75rem", color: C.ink, background: C.paper, border: `1px solid ${C.border}`, borderRadius: 2, padding: "4px 6px" }}>
+              {SLEEP_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+          <div style={{ gridColumn: "1/-1", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px 14px" }}>
+            <div>
+              <div style={{ fontSize: "0.6rem", letterSpacing: "0.1em", color: C.inkLight, textTransform: "uppercase", marginBottom: 4 }}>日本語の声</div>
+              <select value={voiceJa} onChange={e => setVoiceJa(e.target.value)}
+                style={{ width: "100%", fontSize: "0.75rem", color: C.ink, background: C.paper, border: `1px solid ${C.border}`, borderRadius: 2, padding: "4px 6px" }}>
+                {jaVoices.map(v => <option key={voices.indexOf(v)} value={String(voices.indexOf(v))}>{v.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <div style={{ fontSize: "0.6rem", letterSpacing: "0.1em", color: C.inkLight, textTransform: "uppercase", marginBottom: 4 }}>英語の声</div>
+              <select value={voiceEn} onChange={e => setVoiceEn(e.target.value)}
+                style={{ width: "100%", fontSize: "0.75rem", color: C.ink, background: C.paper, border: `1px solid ${C.border}`, borderRadius: 2, padding: "4px 6px" }}>
+                {enVoices.map(v => <option key={voices.indexOf(v)} value={String(voices.indexOf(v))}>{v.name}</option>)}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        {/* ═══ NORMAL MODE ═══ */}
+        {mode === "normal" && (
+          <>
+            <div style={{ background: C.paper, border: `1px solid ${C.border}`, borderRadius: 2, padding: "10px 14px", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <Btn onClick={togglePlay} disabled={!paragraphs.length} variant="primary">
+                {isPlaying ? "⏸ 一時停止" : isPaused ? "▶ 再開" : "▶ 再生"}
+              </Btn>
+              <Btn onClick={stop}>■ 停止</Btn>
+              <Btn onClick={() => jumpTo(currentIdx - 1)} disabled={!paragraphs.length || currentIdx === 0}>◀ 前</Btn>
+              <Btn onClick={() => jumpTo(currentIdx + 1)} disabled={!paragraphs.length || currentIdx >= paragraphs.length - 1}>次 ▶</Btn>
+              {paragraphs.length > 0 && (
+                <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                  <input type="number" min="1" max={paragraphs.length} value={jumpInput}
+                    onChange={e => setJumpInput(e.target.value)} onKeyDown={e => e.key === "Enter" && handleJump()}
+                    placeholder={`1〜${paragraphs.length}`}
+                    style={{ width: 110, fontSize: "0.75rem", padding: "6px 8px", border: `1px solid ${C.border}`, borderRadius: 2, background: C.bg, color: C.ink, outline: "none" }} />
+                  <Btn onClick={handleJump}>ジャンプ</Btn>
+                </div>
+              )}
+              <div style={{ flex: 1, minWidth: 80 }}>
+                <div style={{ width: "100%", height: 3, background: C.border, borderRadius: 2, overflow: "hidden" }}>
+                  <div style={{ height: "100%", width: `${progress}%`, background: C.accent, transition: "width 0.3s" }} />
+                </div>
+                <div style={{ fontSize: "0.6rem", color: C.inkLight, marginTop: 3 }}>
+                  {paragraphs.length > 0 ? `${currentIdx + 1} / ${paragraphs.length} 段落` : "—"}
+                </div>
+              </div>
+            </div>
+            {status && <div style={{ fontSize: "0.68rem", color: C.inkLight, paddingLeft: 2 }}>
+              {isPlaying && <span style={{ display: "inline-block", width: 6, height: 6, background: C.accent, borderRadius: "50%", marginRight: 6, animation: "pulse 1.2s infinite" }} />}
+              {status}
+            </div>}
+            {paragraphs.length > 0 && (
+              <div style={{ background: C.paper, border: `1px solid ${C.border}`, borderRadius: 2, padding: "18px 24px", height: "52vh", overflowY: "auto" }}>
+                <div style={{ fontSize: "0.58rem", color: "#c0b09a", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 12 }}>段落クリックでジャンプ</div>
+                {paragraphs.map((p, i) => (
+                  <div key={i} ref={el => paraRefs.current[i] = el} onClick={() => jumpTo(i)}
+                    style={{ fontFamily: "serif", fontSize: "1rem", lineHeight: 2.2, marginBottom: "0.8em",
+                      padding: i === currentIdx ? "4px 12px" : "4px 0", marginLeft: i === currentIdx ? -12 : 0,
+                      borderRadius: 2, background: i === currentIdx ? (isEnglish(p) ? C.highlight : C.highlightJa) : "transparent",
+                      color: i < currentIdx ? C.inkLight : C.ink, transition: "background 0.2s", cursor: "pointer", userSelect: "none" }}>
+                    {p}
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ═══ LISTENING MODE ═══ */}
+        {mode === "listening" && (
+          <>
+            {/* fixed action bar at bottom */}
+            <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, zIndex: 100, background: C.paper, borderTop: `1px solid ${C.border}`, padding: "12px 24px", display: "flex", justifyContent: "center", alignItems: "center", gap: 10, flexWrap: "wrap", boxShadow: "0 -2px 12px rgba(0,0,0,0.08)" }}>
+              {listenStep === "playing" ? (
+                <>
+                  <Btn onClick={startListening} disabled={!pairs.length || isPlaying} variant="primary">
+                    {isPlaying ? "🔊 再生中..." : "▶ 再生"}
+                  </Btn>
+                  <Btn onClick={replayPair} disabled={isPlaying}>🔁 もう一度</Btn>
+                </>
+              ) : (
+                <>
+                  <Btn onClick={replayPair} variant="ghost">🔁 もう一度</Btn>
+                  <Btn onClick={showEnglish} disabled={listenStep === "showEn" || listenStep === "showJa"} variant="green">
+                    {listenStep === "showEn" || listenStep === "showJa" ? "✓ 英文表示中" : "👁 英文を見る"}
+                  </Btn>
+                  <Btn onClick={showJapanese} disabled={listenStep === "showJa"} variant="blue">
+                    {listenStep === "showJa" ? "✓ 日本語表示中" : "📖 日本語訳を見る"}
+                  </Btn>
+                  <Btn onClick={nextPair} variant="primary" disabled={currentPairIdx >= pairs.length - 1 && listenStep !== "showJa"}>
+                    次へ ▶
+                  </Btn>
+                </>
+              )}
+              <div style={{ fontSize: "0.65rem", color: C.inkLight, marginLeft: 8 }}>
+                {pairs.length > 0 ? `${currentPairIdx + 1} / ${pairs.length}` : "—"}
+              </div>
+              <div style={{ width: 80, height: 3, background: C.border, borderRadius: 2, overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${pairProgress}%`, background: C.accent, transition: "width 0.3s" }} />
+              </div>
+            </div>
+
+            {/* pair display */}
+            {status && <div style={{ fontSize: "0.68rem", color: C.inkLight, paddingLeft: 2 }}>{status}</div>}
+            <div style={{ background: C.paper, border: `1px solid ${C.border}`, borderRadius: 2, padding: "18px 24px", height: "58vh", overflowY: "auto", paddingBottom: 80 }}>
+              {pairs.length === 0 && <div style={{ color: C.inkLight, fontSize: "0.85rem" }}>テキストを読み込んでください</div>}
+              {pairs.map((pair, i) => (
+                <div key={i} ref={el => pairRefs.current[i] = el}
+                  style={{ marginBottom: "2em", padding: "12px 14px", borderRadius: 3,
+                    border: i === currentPairIdx ? `1.5px solid ${C.accentPale}` : `1px solid transparent`,
+                    background: i === currentPairIdx ? "#fdf8f0" : "transparent",
+                    opacity: i < currentPairIdx ? 0.45 : 1, transition: "all 0.2s" }}>
+
+                  {/* pair number */}
+                  <div style={{ fontSize: "0.6rem", color: C.accentPale, letterSpacing: "0.1em", marginBottom: 6 }}>
+                    {i + 1} / {pairs.length}
+                  </div>
+
+                  {/* English */}
+                  <div style={{ fontFamily: "serif", fontSize: "1rem", lineHeight: 2,
+                    filter: i === currentPairIdx && listenStep === "playing" ? "blur(6px)" : "none",
+                    color: C.ink, transition: "filter 0.4s", userSelect: listenStep === "playing" && i === currentPairIdx ? "none" : "auto",
+                    marginBottom: "0.6em" }}>
+                    {pair.en || pair.single}
+                  </div>
+
+                  {/* Japanese */}
+                  {pair.ja && (
+                    <div style={{ fontFamily: "sans-serif", fontSize: "0.92rem", lineHeight: 1.9,
+                      color: "#2d6a4f",
+                      filter: i === currentPairIdx && listenStep !== "showJa" ? "blur(6px)" : "none",
+                      transition: "filter 0.4s",
+                      userSelect: i === currentPairIdx && listenStep !== "showJa" ? "none" : "auto",
+                      borderTop: `1px solid ${C.border}`, paddingTop: "0.5em", marginTop: "0.3em" }}>
+                      {pair.ja}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+
+      <style>{`@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
+    </div>
+  );
+}
+
+        
+        
+        
+        
+        // -------------------------------------------------------------------
+        // 最後に、画面に表示するための命令を必ず追加してください。
+        // もしコンポーネント名が「Reader」であれば、以下の行を一番最後に足します。
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<Reader />);
+    </script>
+</body>
+</html>
